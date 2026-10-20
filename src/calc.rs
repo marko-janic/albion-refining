@@ -214,6 +214,18 @@ pub struct Quote {
     pub sources: Vec<Source>,
     /// Set when the price is an average from the price history instead of current orders.
     pub history: Option<HistoryInfo>,
+    /// Set when the price history average was higher than the current price, so the current price
+    /// is used instead.
+    pub capped: Option<CappedHistory>,
+}
+
+/// A price history average that was ignored because it is above what the market pays right now.
+#[derive(Clone, PartialEq, Debug)]
+pub struct CappedHistory {
+    /// Name of the time window, e.g. "4-week".
+    pub window: &'static str,
+    /// The history average that was not used.
+    pub average: f64,
 }
 
 /// What a price from the price history is based on.
@@ -239,7 +251,7 @@ pub struct Source {
 
 impl Quote {
     pub fn flat(price: f64) -> Self {
-        Self { average: price, limit: price, sources: Vec::new(), history: None }
+        Self { average: price, limit: price,         sources: Vec::new(), history: None, capped: None }
     }
 }
 
@@ -271,14 +283,33 @@ pub fn recipe_label(recipe: &Recipe) -> String {
     label
 }
 
-/// Number of units to buy to be able to make `crafts` crafts in total when the resources that
-/// come back from every craft are used for further crafts (all with focus).
+/// Crafts' worth of ingredients (in units) that have to be bought to make `crafts` crafts in total
+/// when the resources that come back from every craft are used for further crafts (all with focus).
 ///
 /// Buying `x` crafts' worth gives `x` crafts, which return `x * r` crafts' worth, which give
 /// `x * r` more crafts, and so on: `x * (1 + r + r^2 + ...) = x / (1 - r)` crafts in total.
 /// Solving that backwards for `crafts` gives `crafts * (1 - r)` crafts' worth to buy.
+pub fn net_units(crafts: u64, per_craft: u32, return_rate: f64) -> f64 {
+    crafts as f64 * per_craft as f64 * (1.0 - return_rate)
+}
+
+/// Number of whole units to buy for `crafts` crafts, see `net_units`.
 fn units_needed(crafts: u64, per_craft: u32, return_rate: f64) -> u64 {
-    ((crafts as f64 * per_craft as f64 * (1.0 - return_rate)).ceil() as u64).max(1)
+    (net_units(crafts, per_craft, return_rate).ceil() as u64).max(1)
+}
+
+/// Return rate of crafting with focus in the configured city.
+pub fn focus_return_rate(s: &Settings) -> f64 {
+    return_rate(s.lpb + s.daily_bonus + FOCUS_LPB)
+}
+
+/// Station usage fee of one craft in silver (the fee is not charged for T2).
+pub fn craft_fee(recipe: &Recipe, s: &Settings) -> f64 {
+    if recipe.tier <= 2 {
+        0.0
+    } else {
+        0.1125 * recipe.item_value as f64 * s.usage_fee / 100.0
+    }
 }
 
 /// Profit per craft. With a focus volume set, prices are averaged over the orders that
@@ -287,7 +318,7 @@ pub fn evaluate(recipe: &Recipe, quotes: &dyn Quotes, s: &Settings) -> Result<Ou
     let focus = focus_cost(recipe.focus, recipe.tier, &s.mastery);
     let lpb = s.lpb + s.daily_bonus;
     let rate = return_rate(lpb);
-    let rate_focus = return_rate(lpb + FOCUS_LPB);
+    let rate_focus = focus_return_rate(s);
 
     let crafts = if s.focus_volume > 0.0 { ((s.focus_volume / focus).floor() as u64).max(1) } else { 1 };
     let (raw_qty, prev_qty, sell_qty) = if s.focus_volume > 0.0 {
@@ -317,11 +348,7 @@ pub fn evaluate(recipe: &Recipe, quotes: &dyn Quotes, s: &Settings) -> Result<Ou
     let material_cost = gross_materials * (1.0 - rate);
     let material_cost_focus = gross_materials * (1.0 - rate_focus);
 
-    let usage_fee = if recipe.tier <= 2 {
-        0.0
-    } else {
-        0.1125 * recipe.item_value as f64 * s.usage_fee / 100.0
-    };
+    let usage_fee = craft_fee(recipe, s);
     let revenue = sell.average * recipe.amount as f64 * (1.0 - s.market_tax / 100.0);
     let profit = revenue - material_cost - usage_fee;
     let profit_focus = revenue - material_cost_focus - usage_fee;
@@ -457,7 +484,7 @@ mod tests {
     impl Quotes for Shallow {
         fn buy(&self, _key: &PriceKey, qty: u64) -> Result<Quote, Shortage> {
             if qty <= 12 {
-                Ok(Quote { average: 100.0, limit: 100.0 + qty as f64, sources: Vec::new(), history: None })
+                Ok(Quote { average: 100.0, limit: 100.0 + qty as f64, sources: Vec::new(), history: None, capped: None })
             } else {
                 Err(Shortage::NotEnough)
             }

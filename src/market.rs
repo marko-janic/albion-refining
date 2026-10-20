@@ -181,6 +181,56 @@ pub fn city_matches(city: &str, filter: &str) -> bool {
     filter == "any" || normalize(city) == normalize(filter)
 }
 
+/// The cities of the main markets; names in the config are checked against these.
+pub const KNOWN_CITIES: [&str; 8] =
+    ["Thetford", "Lymhurst", "Bridgewatch", "Martlock", "Fort Sterling", "Caerleon", "Brecilien", "Black Market"];
+
+/// A white list of cities. Only these cities are used; an empty list stands for every city.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cities(Vec<String>);
+
+impl Cities {
+    /// Every city.
+    pub fn any() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The listed cities. A list that has "any" in it, or no entries, allows every city.
+    pub fn of<S: AsRef<str>>(names: &[S]) -> Self {
+        let names: Vec<String> =
+            names.iter().map(|n| n.as_ref().trim().to_string()).filter(|n| !n.is_empty()).collect();
+        if names.iter().any(|n| n.eq_ignore_ascii_case("any")) {
+            Self::any()
+        } else {
+            Self(names)
+        }
+    }
+
+    pub fn is_any(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn allows(&self, city: &str) -> bool {
+        self.is_any() || self.0.iter().any(|allowed| normalize(allowed) == normalize(city))
+    }
+
+    /// The one city that is allowed, when the list has exactly one.
+    pub fn single(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        if self.is_any() {
+            "any city".to_string()
+        } else {
+            self.0.join(", ")
+        }
+    }
+}
+
 /// Turns an item id such as `T4_METALBAR_LEVEL1` or `T4_ORE@1` into a refining item.
 pub fn parse_item_id(id: &str, enchant_field: u8) -> Option<PriceKey> {
     let (base, at_enchant) = match id.split_once('@') {
@@ -331,10 +381,10 @@ impl Market {
     /// The price of buying `qty` units from the sell offers of the matching cities. The offers of
     /// all of these cities are put together and taken cheapest first, so the quantity may be bought
     /// in several cities; the quote says how much to buy in each city and up to which price.
-    pub fn buy_quote(&self, key: &PriceKey, city: &str, qty: u64) -> Result<Quote, Shortage> {
+    pub fn buy_quote(&self, key: &PriceKey, cities: &Cities, qty: u64) -> Result<Quote, Shortage> {
         let qty = qty.max(1);
         let mut pool: Vec<(&str, &Order)> = Vec::new();
-        for g in self.groups.iter().filter(|g| g.key() == Some(*key) && !g.request && city_matches(&g.city, city)) {
+        for g in self.groups.iter().filter(|g| g.key() == Some(*key) && !g.request && cities.allows(&g.city)) {
             pool.extend(g.orders.iter().filter(|o| o.amount > 0).map(|o| (g.city.as_str(), o)));
         }
         if pool.is_empty() {
@@ -365,7 +415,7 @@ impl Market {
         if missing > 0.0 {
             return Err(Shortage::NotEnough);
         }
-        Ok(Quote { average: cost / qty as f64, limit, sources, history: None })
+        Ok(Quote { average: cost / qty as f64, limit, sources, history: None, capped: None })
     }
 
     /// Stores the price history of an item for one time window, replacing the previous one. The
@@ -405,12 +455,12 @@ impl Market {
 
     /// The average price an item was sold for in the time window, weighted by the items sold.
     /// Across the matching cities the highest average is taken, and the quote names that city.
-    pub fn history_quote(&self, key: &PriceKey, window: Window, city: &str) -> Option<Quote> {
+    pub fn history_quote(&self, key: &PriceKey, window: Window, cities: &Cities) -> Option<Quote> {
         let mut best: Option<Quote> = None;
         for h in self
             .histories
             .iter()
-            .filter(|h| h.scale == window.scale() && h.key() == Some(*key) && city_matches(&h.city, city))
+            .filter(|h| h.scale == window.scale() && h.key() == Some(*key) && cities.allows(&h.city))
         {
             let Some((traded, average)) = h.totals() else { continue };
             if best.as_ref().is_some_and(|b| b.average >= average) {
@@ -421,6 +471,7 @@ impl Market {
                 limit: average,
                 sources: vec![Source { city: h.city.clone(), limit: average, units: 0 }],
                 history: Some(HistoryInfo { window: window.label(), traded, updated: h.updated }),
+                capped: None,
             });
         }
         best
@@ -462,14 +513,21 @@ impl Market {
     /// The quote also holds the price of the last order that is needed, i.e. how far down the order
     /// book you have to go. Across cities the lowest (`prefer_high == false`) or highest average is
     /// taken among the cities that have enough orders.
-    pub fn quote(&self, key: &PriceKey, side: Side, city: &str, qty: u64, prefer_high: bool) -> Result<Quote, Shortage> {
+    pub fn quote(
+        &self,
+        key: &PriceKey,
+        side: Side,
+        cities: &Cities,
+        qty: u64,
+        prefer_high: bool,
+    ) -> Result<Quote, Shortage> {
         let qty = qty.max(1);
         let mut known = false;
         let mut best: Option<Quote> = None;
         for g in self
             .groups
             .iter()
-            .filter(|g| g.key() == Some(*key) && g.request == (side == Side::Request) && city_matches(&g.city, city))
+            .filter(|g| g.key() == Some(*key) && g.request == (side == Side::Request) && cities.allows(&g.city))
         {
             let live: Vec<&Order> = match side {
                 Side::Offer => g.orders.iter().filter(|o| o.amount > 0).collect(),
@@ -500,6 +558,7 @@ impl Market {
                 limit,
                 sources: vec![Source { city: g.city.clone(), limit, units: qty }],
                 history: None,
+                capped: None,
             };
             let better = match &best {
                 Some(b) if prefer_high => quote.average > b.average,
@@ -519,11 +578,11 @@ impl Market {
 
     /// The best price over the matching cities: per city the lowest sell offer or the highest
     /// buy order, then the lowest (`prefer_high == false`) or highest of those across cities.
-    pub fn price(&self, key: &PriceKey, side: Side, city: &str, prefer_high: bool) -> Option<f64> {
+    pub fn price(&self, key: &PriceKey, side: Side, cities: &Cities, prefer_high: bool) -> Option<f64> {
         let per_city = self
             .groups
             .iter()
-            .filter(|g| g.key() == Some(*key) && g.request == (side == Side::Request) && city_matches(&g.city, city))
+            .filter(|g| g.key() == Some(*key) && g.request == (side == Side::Request) && cities.allows(&g.city))
             .filter_map(|g| {
                 let prices = g.orders.iter().filter(|o| o.amount > 0).map(|o| o.price);
                 match side {
@@ -540,16 +599,16 @@ impl Market {
 
     /// Prices for the profit calculation: raw resources are bought at the lowest sell offer,
     /// refined products are sold at the lowest sell offer or the highest buy order.
-    pub fn live_prices(&self, buy_city: &str, sell_city: &str, sell_to_buy_orders: bool) -> Prices {
+    pub fn live_prices(&self, buy_cities: &Cities, sell_cities: &Cities, sell_to_buy_orders: bool) -> Prices {
         let keys: HashSet<PriceKey> = self.groups.iter().filter_map(|g| g.key()).collect();
         let mut prices = HashMap::new();
         for key in keys {
             let price = if key.raw {
-                self.price(&key, Side::Offer, buy_city, false)
+                self.price(&key, Side::Offer, buy_cities, false)
             } else if sell_to_buy_orders {
-                self.price(&key, Side::Request, sell_city, true)
+                self.price(&key, Side::Request, sell_cities, true)
             } else {
-                self.price(&key, Side::Offer, sell_city, true)
+                self.price(&key, Side::Offer, sell_cities, true)
             };
             if let Some(p) = price {
                 prices.insert(key, p);
@@ -646,7 +705,7 @@ mod tests {
         m.ingest(vec![incoming(1, 90.0, false), incoming(2, 100.0, false), incoming(3, 120.0, false)], 1);
         m.ingest(vec![incoming(2, 100.0, false), incoming(4, 105.0, false)], 2);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
-        assert_eq!(m.price(&key, Side::Offer, "any", false), Some(100.0));
+        assert_eq!(m.price(&key, Side::Offer, &Cities::any(), false), Some(100.0));
         assert_eq!(m.groups[0].orders.len(), 2);
     }
 
@@ -671,9 +730,9 @@ mod tests {
         other.city = "Thetford".into();
         m.ingest(vec![other], 1);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
-        assert_eq!(m.price(&key, Side::Offer, "any", false), Some(70.0));
-        assert_eq!(m.price(&key, Side::Offer, "any", true), Some(90.0));
-        assert_eq!(m.price(&key, Side::Offer, "martlock", false), Some(90.0));
+        assert_eq!(m.price(&key, Side::Offer, &Cities::any(), false), Some(70.0));
+        assert_eq!(m.price(&key, Side::Offer, &Cities::any(), true), Some(90.0));
+        assert_eq!(m.price(&key, Side::Offer, &Cities::of(&["martlock"]), false), Some(90.0));
     }
 
     #[test]
@@ -682,16 +741,62 @@ mod tests {
         // Three sell offers of 10 items each at 100, 110 and 200.
         m.ingest(vec![incoming(1, 100.0, false), incoming(2, 110.0, false), incoming(3, 200.0, false)], 1);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
-        assert_eq!(avg(&m, &key, Side::Offer, "any", 5), Ok(100.0));
-        assert_eq!(avg(&m, &key, Side::Offer, "any", 20), Ok(105.0));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::any(), 5), Ok(100.0));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::any(), 20), Ok(105.0));
         // 25 items: 10 * 100 + 10 * 110 + 5 * 200 = 3100
-        assert_eq!(avg(&m, &key, Side::Offer, "any", 25), Ok(124.0));
-        assert_eq!(avg(&m, &key, Side::Offer, "any", 31), Err(Shortage::NotEnough));
-        assert_eq!(avg(&m, &PriceKey::raw(Resource::Cloth, 4, 0), Side::Offer, "any", 1), Err(Shortage::NoPrice));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::any(), 25), Ok(124.0));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::any(), 31), Err(Shortage::NotEnough));
+        assert_eq!(avg(&m, &PriceKey::raw(Resource::Cloth, 4, 0), Side::Offer, &Cities::any(), 1), Err(Shortage::NoPrice));
     }
 
-    fn avg(m: &Market, key: &PriceKey, side: Side, city: &str, qty: u64) -> Result<f64, Shortage> {
-        m.quote(key, side, city, qty, side == Side::Request).map(|q| q.average)
+    fn avg(m: &Market, key: &PriceKey, side: Side, cities: &Cities, qty: u64) -> Result<f64, Shortage> {
+        m.quote(key, side, cities, qty, side == Side::Request).map(|q| q.average)
+    }
+
+    #[test]
+    fn a_white_list_of_cities() {
+        let none = Cities::any();
+        assert!(none.is_any() && none.allows("Anywhere"));
+        assert_eq!(Cities::of::<&str>(&[]), none, "an empty list allows every city");
+        assert_eq!(Cities::of(&["Martlock", "any"]), none, "\"any\" in the list allows every city");
+
+        let two = Cities::of(&["Fort Sterling", " thetford "]);
+        assert!(two.allows("Thetford") && two.allows("fortsterling"));
+        assert!(!two.allows("Martlock"));
+        assert_eq!(two.single(), None);
+        assert_eq!(Cities::of(&["Martlock"]).single(), Some("Martlock"));
+        assert_eq!(two.describe(), "Fort Sterling, thetford");
+        assert_eq!(none.describe(), "any city");
+    }
+
+    #[test]
+    fn only_the_listed_cities_are_used() {
+        let mut m = Market::default();
+        // Sell offers: Martlock 100, Thetford 110, Lymhurst 120 (10 items each).
+        for (city, price) in [("Martlock", 100.0), ("Thetford", 110.0), ("Lymhurst", 120.0)] {
+            let mut o = incoming(1, price, false);
+            o.city = city.into();
+            m.ingest(vec![o], 1);
+        }
+        let key = PriceKey::raw(Resource::Metal, 4, 1);
+
+        // Buying 15 items from Thetford and Lymhurst only: 10 * 110 + 5 * 120, Martlock is not touched.
+        let allowed = Cities::of(&["Thetford", "Lymhurst"]);
+        let q = m.buy_quote(&key, &allowed, 15).unwrap();
+        assert_eq!(q.average, (10.0 * 110.0 + 5.0 * 120.0) / 15.0);
+        assert!(q.sources.iter().all(|s| s.city != "Martlock"));
+        assert_eq!(m.buy_quote(&key, &Cities::any(), 15).unwrap().sources[0].city, "Martlock");
+
+        // 25 items do not fit into the two allowed cities, although Martlock has more.
+        assert_eq!(m.buy_quote(&key, &allowed, 25), Err(Shortage::NotEnough));
+        // A city without data is a missing price, not a shortage.
+        assert_eq!(m.buy_quote(&key, &Cities::of(&["Caerleon"]), 1), Err(Shortage::NoPrice));
+
+        // Selling: the best paying of the allowed cities.
+        let best = m.quote(&key, Side::Offer, &allowed, 1, true).unwrap();
+        assert_eq!(best.sources[0].city, "Lymhurst");
+        assert_eq!(m.price(&key, Side::Offer, &Cities::of(&["Martlock", "Thetford"]), true), Some(110.0));
+        assert_eq!(m.price(&key, Side::Offer, &Cities::of(&["Martlock", "Thetford"]), false), Some(100.0));
     }
 
     #[test]
@@ -699,7 +804,7 @@ mod tests {
         let mut m = Market::default();
         m.ingest(vec![incoming(1, 100.0, false), incoming(2, 110.0, false), incoming(3, 200.0, false)], 1);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
-        let limit = |qty| m.quote(&key, Side::Offer, "any", qty, false).unwrap().limit;
+        let limit = |qty| m.quote(&key, Side::Offer, &Cities::any(), qty, false).unwrap().limit;
         assert_eq!(limit(1), 100.0);
         assert_eq!(limit(10), 100.0);
         assert_eq!(limit(11), 110.0);
@@ -720,18 +825,18 @@ mod tests {
         // 10 items for 1000 silver and 30 items for 4200: 5200 / 40 = 130 per item.
         m.ingest_history(history("Martlock", Window::Month, vec![point(10, 1000.0), point(30, 4200.0), point(0, 0.0)]), 5);
         let key = PriceKey::refined(Resource::Metal, 4, 1);
-        let quote = m.history_quote(&key, Window::Month, "any").unwrap();
+        let quote = m.history_quote(&key, Window::Month, &Cities::any()).unwrap();
         assert_eq!(quote.average, 130.0);
         let info = quote.history.unwrap();
         assert_eq!((info.window, info.traded, info.updated), ("4-week", 40, 5));
         assert_eq!(quote.sources[0].city, "Martlock");
 
         // Other windows and other items have no history.
-        assert!(m.history_quote(&key, Window::Day, "any").is_none());
-        assert!(m.history_quote(&PriceKey::refined(Resource::Metal, 5, 1), Window::Month, "any").is_none());
+        assert!(m.history_quote(&key, Window::Day, &Cities::any()).is_none());
+        assert!(m.history_quote(&PriceKey::refined(Resource::Metal, 5, 1), Window::Month, &Cities::any()).is_none());
         // A history in which nothing was sold has no average.
         m.ingest_history(history("Thetford", Window::Month, vec![point(0, 0.0)]), 6);
-        assert_eq!(m.history_quote(&key, Window::Month, "thetford").map(|q| q.average), None);
+        assert_eq!(m.history_quote(&key, Window::Month, &Cities::of(&["thetford"])).map(|q| q.average), None);
     }
 
     #[test]
@@ -740,14 +845,14 @@ mod tests {
         m.ingest_history(history("Martlock", Window::Day, vec![point(10, 1000.0)]), 1);
         m.ingest_history(history("Thetford", Window::Day, vec![point(10, 1200.0)]), 1);
         let key = PriceKey::refined(Resource::Metal, 4, 1);
-        let best = m.history_quote(&key, Window::Day, "any").unwrap();
+        let best = m.history_quote(&key, Window::Day, &Cities::any()).unwrap();
         assert_eq!((best.average, best.sources[0].city.as_str()), (120.0, "Thetford"));
-        assert_eq!(m.history_quote(&key, Window::Day, "martlock").unwrap().average, 100.0);
+        assert_eq!(m.history_quote(&key, Window::Day, &Cities::of(&["martlock"])).unwrap().average, 100.0);
 
         // A new series for the same item, city and window replaces the old one.
         m.ingest_history(history("Thetford", Window::Day, vec![point(10, 900.0)]), 2);
         assert_eq!(m.histories.len(), 2);
-        assert_eq!(m.history_quote(&key, Window::Day, "any").unwrap().average, 100.0);
+        assert_eq!(m.history_quote(&key, Window::Day, &Cities::any()).unwrap().average, 100.0);
     }
 
     #[test]
@@ -806,16 +911,16 @@ mod tests {
         let key = PriceKey::raw(Resource::Metal, 4, 1);
 
         // 25 items: 10 * 100 + 10 * 110 + 5 * 120 = 2700
-        let q = m.buy_quote(&key, "any", 25).unwrap();
+        let q = m.buy_quote(&key, &Cities::any(), 25).unwrap();
         assert_eq!(q.average, 108.0);
         assert_eq!(q.limit, 120.0);
         let sources: Vec<_> = q.sources.iter().map(|s| (s.city.as_str(), s.limit, s.units)).collect();
         assert_eq!(sources, [("Martlock", 100.0, 10), ("Thetford", 120.0, 15)]);
 
         // One city alone does not have enough, and a missing item is something else.
-        assert_eq!(m.buy_quote(&key, "martlock", 25), Err(Shortage::NotEnough));
-        assert_eq!(m.buy_quote(&key, "martlock", 15).unwrap().sources.len(), 1);
-        assert_eq!(m.buy_quote(&PriceKey::raw(Resource::Cloth, 4, 0), "any", 1), Err(Shortage::NoPrice));
+        assert_eq!(m.buy_quote(&key, &Cities::of(&["martlock"]), 25), Err(Shortage::NotEnough));
+        assert_eq!(m.buy_quote(&key, &Cities::of(&["martlock"]), 15).unwrap().sources.len(), 1);
+        assert_eq!(m.buy_quote(&PriceKey::raw(Resource::Cloth, 4, 0), &Cities::any(), 1), Err(Shortage::NoPrice));
     }
 
     #[test]
@@ -823,8 +928,8 @@ mod tests {
         let mut m = Market::default();
         m.ingest(vec![incoming(1, 300.0, true), incoming(2, 280.0, true), incoming(3, 100.0, true)], 1);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
-        assert_eq!(avg(&m, &key, Side::Request, "any", 15), Ok((10.0 * 300.0 + 5.0 * 280.0) / 15.0));
-        assert_eq!(m.quote(&key, Side::Request, "any", 15, true).unwrap().limit, 280.0);
+        assert_eq!(avg(&m, &key, Side::Request, &Cities::any(), 15), Ok((10.0 * 300.0 + 5.0 * 280.0) / 15.0));
+        assert_eq!(m.quote(&key, Side::Request, &Cities::any(), 15, true).unwrap().limit, 280.0);
     }
 
     #[test]
@@ -837,7 +942,7 @@ mod tests {
         m.ingest(vec![deep], 1);
         let key = PriceKey::raw(Resource::Metal, 4, 1);
         // Martlock is cheaper but has only 10 items.
-        assert_eq!(avg(&m, &key, Side::Offer, "any", 50), Ok(150.0));
-        assert_eq!(avg(&m, &key, Side::Offer, "martlock", 50), Err(Shortage::NotEnough));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::any(), 50), Ok(150.0));
+        assert_eq!(avg(&m, &key, Side::Offer, &Cities::of(&["martlock"]), 50), Err(Shortage::NotEnough));
     }
 }

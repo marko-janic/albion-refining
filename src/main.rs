@@ -4,9 +4,10 @@ mod data;
 mod ids;
 mod ingest;
 mod market;
+mod plan;
 
-use calc::{evaluate, group, Outcome, PriceKey, Prices, Quote, Quotes, Resource, Settings, Shortage, ALL_RESOURCES};
-use market::{age_text, Market, Side, Window};
+use calc::{evaluate, group, CappedHistory, Outcome, PriceKey, Prices, Quote, Quotes, Resource, Settings, Shortage, ALL_RESOURCES};
+use market::{age_text, Cities, Market, Side, Window};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -20,10 +21,10 @@ const STATE_FILE: &str = "albion_state.txt";
 pub struct App {
     settings: Settings,
     prices: Prices,
-    /// City to buy raw resources in ("any" = the cheapest city).
-    pub buy_city: String,
-    /// City to sell refined products in ("any" = the best paying city).
-    pub sell_city: String,
+    /// Cities the raw resources and lower tier items may be bought in.
+    pub buy_cities: Cities,
+    /// Cities the refined products may be sold in.
+    pub sell_cities: Cities,
     /// Sell to the highest buy order instead of listing at the lowest sell order.
     pub sell_to_buy_orders: bool,
     /// Price history window the selling price is taken from instead of the current orders.
@@ -117,8 +118,8 @@ impl App {
         let mut app = App {
             settings: Settings::default(),
             prices: Prices::new(),
-            buy_city: "any".into(),
-            sell_city: "any".into(),
+            buy_cities: Cities::any(),
+            sell_cities: Cities::any(),
             sell_to_buy_orders: false,
             sell_average: None,
             ingest_port: 8080,
@@ -135,8 +136,8 @@ impl App {
 
     fn apply(&mut self, config: config::Config) {
         self.settings = config.settings;
-        self.buy_city = config.buy_city;
-        self.sell_city = config.sell_city;
+        self.buy_cities = config.buy_cities;
+        self.sell_cities = config.sell_cities;
         self.sell_to_buy_orders = config.sell_to_buy_orders;
         self.sell_average = config.sell_average;
         self.ingest_port = config.ingest_port;
@@ -209,6 +210,10 @@ impl App {
             }
             "live" => {
                 self.live();
+                changed = false;
+            }
+            "plan" => {
+                self.plan(args);
                 changed = false;
             }
             "top" | "run" => {
@@ -285,6 +290,157 @@ impl App {
             group(orders as f64, 0),
             histories_text(histories)
         );
+    }
+
+    /// Splits the focus volume over the best recipes and prints what to buy and where to sell.
+    fn plan(&self, args: &[&str]) {
+        let count = match args.first() {
+            None => 5,
+            Some(a) => match a.parse::<usize>() {
+                Ok(n) if (1..=30).contains(&n) => n,
+                _ => {
+                    println!("Usage: plan [number of recipes, 1-30]");
+                    return;
+                }
+            },
+        };
+        print!("{}", self.plan_text(&Market::load(), count));
+    }
+
+    pub fn plan_text(&self, market: &Market, count: usize) -> String {
+        let budget = self.settings.focus_volume;
+        if budget <= 0.0 {
+            return "The plan splits your focus volume over several recipes: set \"focus_volume\" in config.json first.\n"
+                .to_string();
+        }
+        let recipes: Vec<&calc::Recipe> = data::RECIPES.iter().collect();
+        let quotes = MarketQuotes { app: self, market };
+        let result = plan::plan(&recipes, &quotes, &self.settings, budget, count);
+        if result.rows.is_empty() {
+            return format!(
+                "No recipe earns anything with the market data you have for {} focus (browse more of the market, or \
+                 check that the ingredients and the products have prices).\n",
+                group(budget, 0)
+            );
+        }
+        // The best of the recipes in the plan when it gets all the focus alone.
+        let alone = result
+            .rows
+            .iter()
+            .map(|row| plan::plan(&[row.recipe], &quotes, &self.settings, budget, 1))
+            .max_by(|a, b| a.profit().total_cmp(&b.profit()))
+            .expect("the plan has at least one recipe");
+
+        let mut out = format!(
+            "Plan for {} focus over at most {} recipes. Every bit of focus goes to the recipe that earns the most extra \
+             profit per focus right now, so a recipe stops getting more focus once the next orders of the market are too \
+             expensive (or too cheap when selling) compared with the others. The recipes are picked along the way.\n\
+             Revenue is after market tax; Exp. profit is revenue minus ingredients and station fees.\n\n",
+            group(budget, 0),
+            count
+        );
+        out.push_str(&format!(
+            "{:<34} {:>9} {:>6} {:>7} {:>15} {:>15} {:>15} {:>10}\n",
+            "Recipe", "Focus", "Share", "Crafts", "Ingredients", "Revenue", "Exp. profit", "Profit/foc"
+        ));
+        for row in &result.rows {
+            out.push_str(&format!(
+                "{:<34} {:>9} {:>6} {:>7} {:>15} {:>15} {:>15} {:>10}\n",
+                calc::recipe_label(row.recipe),
+                group(row.focus, 0),
+                format!("{:.0}%", row.focus / budget * 100.0),
+                group(row.crafts as f64, 0),
+                group(row.ingredients, 0),
+                group(row.revenue, 0),
+                group(row.profit(), 0),
+                group(row.profit() / row.focus, 1)
+            ));
+        }
+        out.push_str(&format!(
+            "{:<34} {:>9} {:>6} {:>7} {:>15} {:>15} {:>15} {:>10}\n",
+            "Total",
+            group(result.focus_used, 0),
+            format!("{:.0}%", result.focus_used / budget * 100.0),
+            group(result.rows.iter().map(|r| r.crafts).sum::<u64>() as f64, 0),
+            group(result.ingredient_cost, 0),
+            group(result.revenue, 0),
+            group(result.profit(), 0),
+            group(result.profit() / result.focus_used.max(1.0), 1)
+        ));
+        if result.fees > 0.0 {
+            out.push_str(&format!("Station fees included: {}\n", group(result.fees, 0)));
+        }
+
+        let u = &result.unused;
+        let mut reasons: Vec<&str> = Vec::new();
+        if u.unprofitable {
+            reasons.push("more crafts of these recipes would lose silver");
+        }
+        if u.market_too_small {
+            reasons.push("the market has no more ingredients or buyers for these recipes");
+        }
+        if u.recipe_limit {
+            reasons.push("other recipes would still earn something but the plan is limited to this many recipes");
+        }
+        if u.focus >= budget * 0.01 && !reasons.is_empty() {
+            out.push_str(&format!(
+                "{} focus is left unused: {}.{}\n",
+                group(u.focus, 0),
+                reasons.join("; "),
+                if u.recipe_limit { format!(" Try 'plan {}'.", count + 3) } else { String::new() }
+            ));
+        }
+        let gain = result.profit() - alone.profit();
+        let name = alone.rows.first().map(|r| calc::recipe_label(r.recipe)).unwrap_or_default();
+        if gain > 0.5 {
+            out.push_str(&format!(
+                "The best of these recipes alone ({name}) would earn {}, so splitting earns {} more.\n",
+                group(alone.profit(), 0),
+                group(gain, 0)
+            ));
+        } else {
+            out.push_str(&format!(
+                "Putting all focus into {name} alone earns the same: it is still the best use of the next focus point, \
+                 so nothing is gained by splitting.\n"
+            ));
+        }
+        if result.rows.len() == 1 && count > 1 {
+            out.push_str(
+                "A single recipe takes all the focus when its extra crafts stay more profitable than the first crafts of \
+                 any other. Its ingredients get more expensive as you buy more, but with sell_mode \"offer\" or a \
+                 history average the plan assumes any number of products sell at that price. With sell_mode \
+                 \"request\" the buy orders of the market limit what you can sell.\n",
+            );
+        }
+
+        out.push_str("\nBuy, for all recipes together:\n");
+        for p in &result.purchases {
+            out.push_str(&format!(
+                "  {} x {} @ average {} each (for {})\n",
+                group(p.units as f64, 0),
+                p.key.label(),
+                group(p.quote.average, 0),
+                p.used_by.join(", ")
+            ));
+            if p.quote.sources.is_empty() {
+                out.push_str("      price you typed in\n");
+            }
+            for (i, s) in p.quote.sources.iter().enumerate() {
+                let lead = if i == 0 { "buy in" } else { "and in" };
+                out.push_str(&format!("      {lead} {} up to {} ({})\n", s.city, group(s.limit, 0), units(s.units)));
+            }
+        }
+
+        out.push_str("\nSell:\n");
+        let now = ingest::now();
+        for s in &result.sales {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                s.key.label(),
+                sell_description(&s.quote, s.units, &self.sell_cities, self.sell_to_buy_orders, self.sell_average, now)
+            ));
+        }
+        out
     }
 
     /// Prints the market data as the listener receives it until Enter is pressed.
@@ -417,9 +573,9 @@ impl App {
         );
         println!("Prices typed in: {}, captured from the market: {}", self.prices.len(), Market::load().groups.len());
         println!(
-            "Buying raw resources: {}, selling refined products: {} ({})",
-            self.buy_city,
-            self.sell_city,
+            "Buying raw resources in: {}. Selling refined products in: {} ({})",
+            self.buy_cities.describe(),
+            self.sell_cities.describe(),
             if self.sell_to_buy_orders { "to the highest buy order" } else { "at the lowest sell order" }
         );
         match self.sell_average {
@@ -435,13 +591,35 @@ impl App {
     /// refined product (the one that is sold) wins over the market; typed-in raw prices are only
     /// used for items the market data knows nothing about.
     pub fn prices_with(&self, market: &Market) -> Prices {
-        let mut prices = market.live_prices(&self.buy_city, &self.sell_city, self.sell_to_buy_orders);
+        let mut prices = market.live_prices(&self.buy_cities, &self.sell_cities, self.sell_to_buy_orders);
         for (key, price) in &self.prices {
             if !key.raw || !prices.contains_key(key) {
                 prices.insert(*key, *price);
             }
         }
         prices
+    }
+
+    /// Evaluates all recipes and sorts the ones that have all their prices, best first. The second
+    /// result lists the recipes the market does not have enough volume for.
+    fn rank(&self, market: &Market, sort: &str, only: Option<Resource>) -> (Vec<Outcome>, Vec<String>) {
+        let quotes = MarketQuotes { app: self, market };
+        let mut ranked: Vec<Outcome> = Vec::new();
+        let mut too_shallow: Vec<String> = Vec::new();
+        for recipe in data::RECIPES.iter().filter(|r| only.is_none_or(|o| r.res == o)) {
+            match evaluate(recipe, &quotes, &self.settings) {
+                Ok(outcome) => ranked.push(outcome),
+                Err(Shortage::NotEnough) => too_shallow.push(calc::recipe_label(recipe)),
+                Err(Shortage::NoPrice) => {}
+            }
+        }
+        let key = |o: &Outcome| match sort {
+            "nofocus" => o.profit,
+            "perfocus" => o.profit_per_focus,
+            _ => o.profit_focus,
+        };
+        ranked.sort_by(|a, b| key(b).total_cmp(&key(a)));
+        (ranked, too_shallow)
     }
 
     /// The ranking table of the most profitable recipes.
@@ -453,16 +631,8 @@ impl App {
         only: Option<Resource>,
         details: bool,
     ) -> Result<String, String> {
-        let quotes = MarketQuotes { app: self, market };
-        let mut outcomes: Vec<Outcome> = Vec::new();
-        let mut too_shallow: Vec<String> = Vec::new();
-        for recipe in data::RECIPES.iter().filter(|r| only.is_none_or(|o| r.res == o)) {
-            match evaluate(recipe, &quotes, &self.settings) {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(Shortage::NotEnough) => too_shallow.push(calc::recipe_label(recipe)),
-                Err(Shortage::NoPrice) => {}
-            }
-        }
+        let (ranked, too_shallow) = self.rank(market, sort, only);
+        let outcomes: Vec<&Outcome> = ranked.iter().collect();
         let volume_note = if self.settings.focus_volume > 0.0 {
             format!(
                 "Prices are averaged over the orders needed to refine {} focus worth of each product, counting the crafts made \
@@ -492,12 +662,6 @@ impl App {
             };
             return Err(format!("{reason}{volume_note}{left_out}"));
         }
-        let key = |o: &Outcome| match sort {
-            "nofocus" => o.profit,
-            "perfocus" => o.profit_per_focus,
-            _ => o.profit_focus,
-        };
-        outcomes.sort_by(|a, b| key(b).total_cmp(&key(a)));
 
         let mut out = format!(
             "Sorted by {} ({} recipes with complete prices). Profit+foc and Profit/foc are per craft; Ingredients and \
@@ -526,7 +690,7 @@ impl App {
             "{:<34} {:>10} {:>11} {:>7} {:>7} {:>10} {:>15} {:>15}\n",
             "Product", "Sell", "Profit+foc", "Focus", "Crafts", "Profit/foc", "Ingredients", "Exp. profit"
         ));
-        for o in outcomes.iter().take(count) {
+        for o in outcomes.iter().take(count).copied() {
             out.push_str(&format!(
                 "{:<34} {:>10} {:>11} {:>7} {:>7} {:>10} {:>15} {:>15}\n",
                 o.label,
@@ -544,7 +708,7 @@ impl App {
                 }
                 out.push_str(&sell_text(
                     o,
-                    &self.sell_city,
+                    &self.sell_cities,
                     self.sell_to_buy_orders,
                     self.sell_average,
                     ingest::now(),
@@ -596,42 +760,59 @@ fn units(n: u64) -> String {
     if n == 1 { "1 unit".to_string() } else { format!("{} units", group(n as f64, 0)) }
 }
 
-/// The line below a product that says where to sell it. With `sell_city` set to "any" the
-/// quote was made for the best paying city; otherwise it is the city from the config.
-fn sell_text(o: &Outcome, sell_city: &str, to_buy_orders: bool, sell_average: Option<Window>, now: u64) -> String {
-    let q = &o.sell_quote;
-    let any = sell_city.eq_ignore_ascii_case("any");
+/// The line below a product that says where to sell it. With one sell city it is that city;
+/// with several (or any) the quote was made for the best paying of the allowed cities.
+fn sell_text(o: &Outcome, sell_cities: &Cities, to_buy_orders: bool, sell_average: Option<Window>, now: u64) -> String {
+    format!("      {}\n", sell_description(&o.sell_quote, o.sell_units, sell_cities, to_buy_orders, sell_average, now))
+}
+
+/// Where and for how much `units` of a product are sold, e.g. `sell 36 units in Lymhurst: ...`.
+fn sell_description(
+    q: &Quote,
+    units_to_sell: u64,
+    sell_cities: &Cities,
+    to_buy_orders: bool,
+    sell_average: Option<Window>,
+    now: u64,
+) -> String {
+    let single = sell_cities.single();
     let city = match q.sources.first() {
         Some(source) => source.city.clone(),
-        None if !any => sell_city.to_string(),
-        None => String::new(),
+        None => single.map(str::to_string).unwrap_or_default(),
     };
-    let place = match (city.is_empty(), any) {
+    let place = match (city.is_empty(), single.is_some()) {
         (true, _) => String::new(),
-        (false, true) => format!(" in {city} (best paying city)"),
-        (false, false) => format!(" in {city}"),
+        (false, true) => format!(" in {city}"),
+        (false, false) => format!(" in {city} (best paying city)"),
     };
-    let n = units(o.sell_units);
+    let n = units(units_to_sell);
     let (average, limit) = (group(q.average, 0), group(q.limit, 0));
     if q.sources.is_empty() {
-        return format!("      sell {n}{place} at {average} each (using custom value)\n");
+        return format!("sell {n}{place} at {average} each (using custom value)");
     }
     if let Some(h) = &q.history {
         return format!(
-            "      sell {n}{place} at the {} average of {average} each ({} sold, captured {} ago)\n",
+            "sell {n}{place} at the {} average of {average} each ({} sold, captured {} ago)",
             h.window,
             group(h.traded as f64, 0),
             age_text(now.saturating_sub(h.updated))
         );
     }
     let line = if to_buy_orders {
-        format!("      sell {n}{place} to buy orders down to {limit} (average {average} each)")
+        format!("sell {n}{place} to buy orders down to {limit} (average {average} each)")
     } else {
-        format!("      sell {n}{place}: list at {average} each (lowest sell offer there)")
+        format!("sell {n}{place}: list at {average} each (lowest sell offer there)")
     };
+    if let Some(c) = &q.capped {
+        return format!(
+            "{line} [WARNING: the {} average of {} is above the current price, so the current price is used instead]",
+            c.window,
+            group(c.average, 0)
+        );
+    }
     match sell_average {
-        Some(window) => format!("{line} [no {} price history captured, using current orders]\n", window.label()),
-        None => format!("{line}\n"),
+        Some(window) => format!("{line} [no {} price history captured, using current orders]", window.label()),
+        None => line,
     }
 }
 
@@ -647,7 +828,7 @@ struct MarketQuotes<'a> {
 
 impl Quotes for MarketQuotes<'_> {
     fn buy(&self, key: &PriceKey, qty: u64) -> Result<Quote, Shortage> {
-        match self.market.buy_quote(key, &self.app.buy_city, qty) {
+        match self.market.buy_quote(key, &self.app.buy_cities, qty) {
             Err(Shortage::NoPrice) => self.app.prices.buy(key, qty),
             result => result,
         }
@@ -658,22 +839,31 @@ impl Quotes for MarketQuotes<'_> {
         if self.app.prices.contains_key(key) {
             return self.app.prices.sell(key, qty);
         }
+        let current = if self.app.sell_to_buy_orders {
+            self.market.quote(key, Side::Request, &self.app.sell_cities, qty, true)
+        } else {
+            self.market.quote(key, Side::Offer, &self.app.sell_cities, 1, true)
+        };
         if let Some(window) = self.app.sell_average {
-            if let Some(quote) = self.market.history_quote(key, window, &self.app.sell_city) {
-                return Ok(quote);
+            if let Some(history) = self.market.history_quote(key, window, &self.app.sell_cities) {
+                // An average above what the market pays right now is not reachable: use the current price.
+                return match current {
+                    Ok(mut now) if history.average > now.average => {
+                        now.capped = Some(CappedHistory { window: window.label(), average: history.average });
+                        Ok(now)
+                    }
+                    _ => Ok(history),
+                };
             }
         }
-        if self.app.sell_to_buy_orders {
-            self.market.quote(key, Side::Request, &self.app.sell_city, qty, true)
-        } else {
-            self.market.quote(key, Side::Offer, &self.app.sell_city, 1, true)
-        }
+        current
     }
 }
 fn print_help() {
     println!(
         "Commands:
   top [count] [resource] [perfocus|focus|nofocus]   most profitable products (default: 15, by profit per focus point)
+  plan [n]                                          split focus_volume over the top n recipes (default 5) for the highest total profit
   prices [resource|all] [tier]                      type in prices step by step (raw = buy price, refined = sell price)
   set <resource> <tier.ench> <raw|refined> <price>  set a single price, e.g. 'set metal 4.1 refined 950'
   list [resource]                                   show entered prices
@@ -715,6 +905,7 @@ mod tests {
             limit: 7700.0,
             sources: vec![Source { city: city.into(), limit: 7700.0, units: 111 }],
             history: None,
+            capped: None,
         }
     }
 
@@ -724,18 +915,32 @@ mod tests {
             limit: 7776.0,
             sources: vec![Source { city: city.into(), limit: 7776.0, units: 0 }],
             history: Some(calc::HistoryInfo { window: "4-week", traded: 12345, updated: 1000 }),
+            capped: None,
         }
+    }
+
+    #[test]
+    fn warns_when_the_history_average_is_above_the_current_price() {
+        let mut q = quote("Martlock");
+        q.average = 7000.0;
+        q.capped = Some(CappedHistory { window: "4-week", average: 7776.0 });
+        let o = outcome(q, 1);
+        assert_eq!(
+            sell_text(&o, &Cities::of(&["Martlock"]), false, Some(Window::Month), 0),
+            "      sell 1 unit in Martlock: list at 7'000 each (lowest sell offer there) \
+             [WARNING: the 4-week average of 7'776 is above the current price, so the current price is used instead]\n"
+        );
     }
 
     #[test]
     fn says_which_city_pays_best_when_the_sell_city_is_any() {
         let o = outcome(quote("Martlock"), 111);
         assert_eq!(
-            sell_text(&o, "any", true, None, 0),
+            sell_text(&o, &Cities::any(), true, None, 0),
             "      sell 111 units in Martlock (best paying city) to buy orders down to 7'700 (average 7'776 each)\n"
         );
         assert_eq!(
-            sell_text(&o, "any", false, None, 0),
+            sell_text(&o, &Cities::any(), false, None, 0),
             "      sell 111 units in Martlock (best paying city): list at 7'776 each (lowest sell offer there)\n"
         );
     }
@@ -745,12 +950,12 @@ mod tests {
         let o = outcome(history_quote("Martlock"), 111);
         // Captured 2 hours before "now".
         assert_eq!(
-            sell_text(&o, "any", false, Some(Window::Month), 1000 + 7200),
+            sell_text(&o, &Cities::any(), false, Some(Window::Month), 1000 + 7200),
             "      sell 111 units in Martlock (best paying city) at the 4-week average of 7'776 each \
              (12'345 sold, captured 2h ago)\n"
         );
         assert_eq!(
-            sell_text(&o, "Martlock", true, Some(Window::Month), 1000 + 30),
+            sell_text(&o, &Cities::of(&["Martlock"]), true, Some(Window::Month), 1000 + 30),
             "      sell 111 units in Martlock at the 4-week average of 7'776 each (12'345 sold, captured 30s ago)\n"
         );
     }
@@ -759,9 +964,24 @@ mod tests {
     fn says_when_the_history_is_missing_and_current_orders_are_used() {
         let o = outcome(quote("Martlock"), 1);
         assert_eq!(
-            sell_text(&o, "any", false, Some(Window::Day), 0),
+            sell_text(&o, &Cities::any(), false, Some(Window::Day), 0),
             "      sell 1 unit in Martlock (best paying city): list at 7'776 each (lowest sell offer there) \
              [no 24-hour price history captured, using current orders]\n"
+        );
+    }
+
+    #[test]
+    fn several_sell_cities_still_name_the_best_paying_one() {
+        let o = outcome(quote("Thetford"), 1);
+        let two = Cities::of(&["Martlock", "Thetford"]);
+        assert_eq!(
+            sell_text(&o, &two, false, None, 0),
+            "      sell 1 unit in Thetford (best paying city): list at 7'776 each (lowest sell offer there)\n"
+        );
+        // A custom value has no city, and there is no single one to name.
+        assert_eq!(
+            sell_text(&outcome(Quote::flat(500.0), 4), &two, false, None, 0),
+            "      sell 4 units at 500 each (using custom value)\n"
         );
     }
 
@@ -769,7 +989,7 @@ mod tests {
     fn names_the_configured_city_otherwise() {
         let o = outcome(quote("Martlock"), 1);
         assert_eq!(
-            sell_text(&o, "Martlock", true, None, 0),
+            sell_text(&o, &Cities::of(&["Martlock"]), true, None, 0),
             "      sell 1 unit in Martlock to buy orders down to 7'700 (average 7'776 each)\n"
         );
     }
@@ -777,9 +997,9 @@ mod tests {
     #[test]
     fn custom_values_have_no_city_unless_one_is_configured() {
         let o = outcome(Quote::flat(500.0), 4);
-        assert_eq!(sell_text(&o, "any", false, None, 0), "      sell 4 units at 500 each (using custom value)\n");
+        assert_eq!(sell_text(&o, &Cities::any(), false, None, 0), "      sell 4 units at 500 each (using custom value)\n");
         assert_eq!(
-            sell_text(&o, "Thetford", false, Some(Window::Week), 0),
+            sell_text(&o, &Cities::of(&["Thetford"]), false, Some(Window::Week), 0),
             "      sell 4 units in Thetford at 500 each (using custom value)\n"
         );
     }

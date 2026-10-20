@@ -9,10 +9,10 @@
   "refining_city": "royal",
   "daily_bonus": 0,
   "usage_fee": 740,
-  "buy_city": "any",
-  "sell_city": "any",
+  "buy_cities": ["Thetford", "Lymhurst", "Bridgewatch", "Martlock", "Fort Sterling", "Brecilien"],
+  "sell_cities": [],
   "sell_mode": "offer",
-  "sell_average": "off",
-  "focus_volume": 20000,
+  "sell_average": "4w",
+  "focus_volume": 22000,
   "ingest_port": 8080
 }

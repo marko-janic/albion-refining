@@ -238,12 +238,12 @@ pub fn write_live(market: &Market) {
     };
     let text = format!(
         "Albion market, live view - updated {}\n\
-         Buying raw resources: {} | selling refined: {} ({}, {})\n\n\
+         Buying raw resources in: {} | selling refined in: {} ({}, {})\n\n\
          === Most profitable products ===\n{}\n\
          === Market prices seen so far ===\n{}{}",
         clock(),
-        app.buy_city,
-        app.sell_city,
+        app.buy_cities.describe(),
+        app.sell_cities.describe(),
         if app.sell_to_buy_orders { "to the highest buy order" } else { "at the lowest sell order" },
         app.sell_average.map_or("current orders".to_string(), |w| format!("{} average price", w.label())),
         ranking,

@@ -1,5 +1,5 @@
 use crate::calc::Settings;
-use crate::market::Window;
+use crate::market::{Cities, Window, KNOWN_CITIES};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,8 +17,8 @@ const TEMPLATE: &str = r#"{
   "refining_city": "royal",
   "daily_bonus": 0,
   "usage_fee": 0,
-  "buy_city": "any",
-  "sell_city": "any",
+  "buy_cities": [],
+  "sell_cities": [],
   "sell_mode": "offer",
   "sell_average": "off",
   "focus_volume": 0,
@@ -29,8 +29,10 @@ const TEMPLATE: &str = r#"{
 /// Everything that is read from `config.json`.
 pub struct Config {
     pub settings: Settings,
-    pub buy_city: String,
-    pub sell_city: String,
+    /// Cities the ingredients may be bought in.
+    pub buy_cities: Cities,
+    /// Cities the products may be sold in.
+    pub sell_cities: Cities,
     pub sell_to_buy_orders: bool,
     /// Price history window to take the selling price from; None uses the current orders.
     pub sell_average: Option<Window>,
@@ -41,8 +43,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             settings: Settings::default(),
-            buy_city: "any".into(),
-            sell_city: "any".into(),
+            buy_cities: Cities::any(),
+            sell_cities: Cities::any(),
             sell_to_buy_orders: false,
             sell_average: None,
             ingest_port: DEFAULT_PORT,
@@ -61,6 +63,45 @@ const LISTING_FEE_PERCENT: f64 = 2.5;
 const ROYAL_CITY_LPB: f64 = 18.0;
 const BONUS_CITY_LPB: f64 = 58.0;
 
+/// A list of cities in the config: `["Martlock", "Thetford"]`, `[]` for every city, or a single
+/// name (`"Martlock"`, or `"any"`) as older config files have it.
+#[derive(Deserialize, Default)]
+#[serde(untagged)]
+enum CityList {
+    #[default]
+    Unset,
+    One(String),
+    Many(Vec<String>),
+}
+
+impl CityList {
+    /// Checks the names against the known cities and builds the white list.
+    fn into_cities(self, field: &str) -> Result<Cities, String> {
+        let mut names = match self {
+            CityList::Unset => Vec::new(),
+            CityList::One(name) => vec![name],
+            CityList::Many(names) => names,
+        };
+        // Check the names and write them the way the game does.
+        for name in names.iter_mut() {
+            let trimmed = name.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("any") {
+                continue;
+            }
+            match KNOWN_CITIES.iter().find(|known| Cities::of(&[*known]).allows(trimmed)) {
+                Some(known) => *name = known.to_string(),
+                None => {
+                    return Err(format!(
+                        "{field}: unknown city '{trimmed}'. Known cities: {}",
+                        KNOWN_CITIES.join(", ")
+                    ))
+                }
+            }
+        }
+        Ok(Cities::of(&names))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RawConfig {
@@ -68,8 +109,10 @@ struct RawConfig {
     refining_city: String,
     daily_bonus: f64,
     usage_fee: f64,
-    buy_city: String,
-    sell_city: String,
+    #[serde(alias = "buy_city")]
+    buy_cities: CityList,
+    #[serde(alias = "sell_city")]
+    sell_cities: CityList,
     sell_mode: String,
     sell_average: String,
     focus_volume: f64,
@@ -83,8 +126,8 @@ impl Default for RawConfig {
             refining_city: "royal".into(),
             daily_bonus: 0.0,
             usage_fee: 0.0,
-            buy_city: "any".into(),
-            sell_city: "any".into(),
+            buy_cities: CityList::default(),
+            sell_cities: CityList::default(),
             sell_mode: "offer".into(),
             sell_average: "off".into(),
             focus_volume: 0.0,
@@ -128,6 +171,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         other => return Err(format!("sell_mode: '{other}' must be \"offer\" or \"request\"")),
     };
     let market_tax = if sell_to_buy_orders { SALES_TAX_PERCENT } else { SALES_TAX_PERCENT + LISTING_FEE_PERCENT };
+    let buy_cities = raw.buy_cities.into_cities("buy_cities")?;
+    let sell_cities = raw.sell_cities.into_cities("sell_cities")?;
     let sell_average = match raw.sell_average.trim().to_lowercase().as_str() {
         "off" | "" => None,
         "24h" => Some(Window::Day),
@@ -152,8 +197,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
             mastery,
             focus_volume: raw.focus_volume,
         },
-        buy_city: raw.buy_city.trim().to_string(),
-        sell_city: raw.sell_city.trim().to_string(),
+        buy_cities,
+        sell_cities,
         sell_to_buy_orders,
         sell_average,
         ingest_port: raw.ingest_port,
@@ -190,7 +235,7 @@ mod tests {
         assert_eq!(config.settings.lpb, default.settings.lpb);
         assert_eq!(config.settings.market_tax, default.settings.market_tax);
         assert_eq!(config.settings.usage_fee, default.settings.usage_fee);
-        assert_eq!(config.buy_city, "any");
+        assert_eq!(config.buy_cities, Cities::any());
         assert!(!config.sell_to_buy_orders);
         assert_eq!(config.sell_average, None);
         assert_eq!(config.ingest_port, default.ingest_port);
@@ -200,7 +245,7 @@ mod tests {
     fn reads_all_fields() {
         let config = parse(
             r#"{"mastery": {"T4": 60, "t6": 12.5, "8": 100}, "refining_city": "bonus", "daily_bonus": 10,
-                "usage_fee": 250, "buy_city": "Martlock", "sell_city": "Fort Sterling",
+                "usage_fee": 250, "buy_cities": ["Martlock", "thetford"], "sell_cities": ["Fort Sterling"],
                 "sell_mode": "request", "focus_volume": 2000, "ingest_port": 9000}"#,
         )
         .unwrap();
@@ -211,8 +256,8 @@ mod tests {
         assert_eq!(config.settings.daily_bonus, 10.0);
         assert_eq!(config.settings.usage_fee, 250.0);
         assert_eq!(config.settings.market_tax, 4.0);
-        assert_eq!(config.buy_city, "Martlock");
-        assert_eq!(config.sell_city, "Fort Sterling");
+        assert_eq!(config.buy_cities, Cities::of(&["Martlock", "Thetford"]));
+        assert_eq!(config.sell_cities.single(), Some("Fort Sterling"));
         assert!(config.sell_to_buy_orders);
     }
 
@@ -238,6 +283,31 @@ mod tests {
             let config = parse(&format!(r#"{{"sell_average": "{text}"}}"#)).unwrap();
             assert_eq!(config.sell_average, window, "{text}");
         }
+    }
+
+    #[test]
+    fn city_lists_are_white_lists() {
+        let config = parse(r#"{"buy_cities": ["Martlock", "Fort Sterling"], "sell_cities": []}"#).unwrap();
+        assert!(config.buy_cities.allows("Fort Sterling") && !config.buy_cities.allows("Thetford"));
+        assert!(config.sell_cities.is_any(), "an empty list allows every city");
+        assert!(parse(r#"{"buy_cities": ["any"]}"#).unwrap().buy_cities.is_any());
+        assert!(parse("{}").unwrap().sell_cities.is_any());
+    }
+
+    #[test]
+    fn the_old_single_city_settings_still_work() {
+        let config = parse(r#"{"buy_city": "Martlock", "sell_city": "any"}"#).unwrap();
+        assert_eq!(config.buy_cities.single(), Some("Martlock"));
+        assert!(config.sell_cities.is_any());
+    }
+
+    #[test]
+    fn city_names_are_checked() {
+        let err = parse(r#"{"buy_cities": ["Martlock", "Martlok"]}"#).err().unwrap();
+        assert!(err.contains("buy_cities") && err.contains("Martlok") && err.contains("Fort Sterling"), "{err}");
+        assert!(parse(r#"{"sell_cities": ["Caerleon", "black market", "fortsterling"]}"#).is_ok());
+        assert!(parse(r#"{"sell_cities": 5}"#).is_err());
+        assert!(parse(r#"{"sell_cities": [1]}"#).is_err());
     }
 
     #[test]
