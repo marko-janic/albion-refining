@@ -12,6 +12,7 @@
   "buy_city": "any",
   "sell_city": "any",
   "sell_mode": "offer",
-  "focus_volume": 15000,
+  "sell_average": "off",
+  "focus_volume": 20000,
   "ingest_port": 8080
 }

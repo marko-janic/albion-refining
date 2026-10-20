@@ -212,6 +212,19 @@ pub struct Quote {
     pub limit: f64,
     /// Where the items are bought, cheapest city first. Empty for typed-in prices.
     pub sources: Vec<Source>,
+    /// Set when the price is an average from the price history instead of current orders.
+    pub history: Option<HistoryInfo>,
+}
+
+/// What a price from the price history is based on.
+#[derive(Clone, PartialEq, Debug)]
+pub struct HistoryInfo {
+    /// Name of the time window, e.g. "4-week".
+    pub window: &'static str,
+    /// How many items were sold in that time.
+    pub traded: u64,
+    /// Unix seconds when the history was captured.
+    pub updated: u64,
 }
 
 /// Part of a quote that comes from one city.
@@ -226,7 +239,7 @@ pub struct Source {
 
 impl Quote {
     pub fn flat(price: f64) -> Self {
-        Self { average: price, limit: price, sources: Vec::new() }
+        Self { average: price, limit: price, sources: Vec::new(), history: None }
     }
 }
 
@@ -258,7 +271,12 @@ pub fn recipe_label(recipe: &Recipe) -> String {
     label
 }
 
-/// Number of units to buy for `crafts` crafts: what the crafts use up after the return rate.
+/// Number of units to buy to be able to make `crafts` crafts in total when the resources that
+/// come back from every craft are used for further crafts (all with focus).
+///
+/// Buying `x` crafts' worth gives `x` crafts, which return `x * r` crafts' worth, which give
+/// `x * r` more crafts, and so on: `x * (1 + r + r^2 + ...) = x / (1 - r)` crafts in total.
+/// Solving that backwards for `crafts` gives `crafts * (1 - r)` crafts' worth to buy.
 fn units_needed(crafts: u64, per_craft: u32, return_rate: f64) -> u64 {
     ((crafts as f64 * per_craft as f64 * (1.0 - return_rate)).ceil() as u64).max(1)
 }
@@ -341,6 +359,39 @@ pub fn evaluate(recipe: &Recipe, quotes: &dyn Quotes, s: &Settings) -> Result<Ou
 mod tests {
     use super::*;
 
+    /// Crafts made when `units` are bought and everything that comes back is crafted again,
+    /// simulated round by round (expected values).
+    fn crafts_with_recrafting(units: u64, per_craft: u32, return_rate: f64) -> f64 {
+        let mut stock = units as f64;
+        let mut crafts = 0.0;
+        while stock / per_craft as f64 > 1e-9 {
+            let round = stock / per_craft as f64;
+            crafts += round;
+            stock = round * per_craft as f64 * return_rate;
+        }
+        crafts
+    }
+
+    #[test]
+    fn units_needed_is_the_smallest_amount_that_pays_for_all_crafts_with_recrafting() {
+        for (per_craft, lpb) in [(2u32, 77.0), (3, 77.0), (4, 117.0), (5, 117.0), (2, 59.0)] {
+            let rate = return_rate(lpb);
+            for crafts in [1u64, 10, 111, 477, 836] {
+                let units = units_needed(crafts, per_craft, rate);
+                assert!(
+                    crafts_with_recrafting(units, per_craft, rate) >= crafts as f64 - 1e-6,
+                    "{units} units are not enough for {crafts} crafts ({per_craft} per craft, lpb {lpb})"
+                );
+                if units > 1 {
+                    assert!(
+                        crafts_with_recrafting(units - 1, per_craft, rate) < crafts as f64,
+                        "{units} units are more than needed for {crafts} crafts ({per_craft} per craft, lpb {lpb})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn groups_thousands_with_single_quotes() {
         assert_eq!(group(0.0, 0), "0");
@@ -406,7 +457,7 @@ mod tests {
     impl Quotes for Shallow {
         fn buy(&self, _key: &PriceKey, qty: u64) -> Result<Quote, Shortage> {
             if qty <= 12 {
-                Ok(Quote { average: 100.0, limit: 100.0 + qty as f64, sources: Vec::new() })
+                Ok(Quote { average: 100.0, limit: 100.0 + qty as f64, sources: Vec::new(), history: None })
             } else {
                 Err(Shortage::NotEnough)
             }

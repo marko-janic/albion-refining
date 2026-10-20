@@ -1,10 +1,96 @@
-use crate::calc::{group as grouped, PriceKey, Prices, Quote, Resource, Shortage, Source};
+use crate::calc::{group as grouped, HistoryInfo, PriceKey, Prices, Quote, Resource, Shortage, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 pub const MARKET_FILE: &str = "market_data.json";
 const PAGE_SIZE: usize = 50;
+
+/// The three time windows of the price history in the game.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Window {
+    Day,
+    Week,
+    Month,
+}
+
+impl Window {
+    /// Number of the timescale in the messages of the game (0 = 24 hours, 1 = 7 days, 2 = 4 weeks).
+    pub fn scale(self) -> u8 {
+        match self {
+            Window::Day => 0,
+            Window::Week => 1,
+            Window::Month => 2,
+        }
+    }
+
+    pub fn from_scale(scale: u8) -> Option<Window> {
+        [Window::Day, Window::Week, Window::Month].into_iter().find(|w| w.scale() == scale)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Window::Day => "24-hour",
+            Window::Week => "1-week",
+            Window::Month => "4-week",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Window::Day => "24h",
+            Window::Week => "1w",
+            Window::Month => "4w",
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct HistoryPoint {
+    /// Number of items sold in this period.
+    pub amount: i64,
+    /// Total silver they were sold for.
+    pub silver: f64,
+    pub timestamp: u64,
+}
+
+/// The price history of one item in one city for one time window, as sent by the game.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct History {
+    pub city: String,
+    pub res: String,
+    pub tier: u8,
+    pub enchant: u8,
+    pub raw: bool,
+    /// See `Window::scale`.
+    pub scale: u8,
+    /// Unix seconds of the last time this history was updated by the game.
+    pub updated: u64,
+    pub points: Vec<HistoryPoint>,
+}
+
+impl History {
+    pub fn key(&self) -> Option<PriceKey> {
+        Some(PriceKey { res: Resource::parse(&self.res)?, tier: self.tier, enchant: self.enchant, raw: self.raw })
+    }
+
+    /// Items sold and the average price per item, weighted by the number of items sold.
+    pub fn totals(&self) -> Option<(u64, f64)> {
+        let amount: i64 = self.points.iter().filter(|p| p.amount > 0).map(|p| p.amount).sum();
+        if amount <= 0 {
+            return None;
+        }
+        let silver: f64 = self.points.iter().filter(|p| p.amount > 0).map(|p| p.silver).sum();
+        Some((amount as u64, silver / amount as f64))
+    }
+}
+
+pub struct IncomingHistory {
+    pub city: String,
+    pub key: PriceKey,
+    pub window: Window,
+    pub points: Vec<HistoryPoint>,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Order {
@@ -39,6 +125,8 @@ impl Group {
 #[derive(Serialize, Deserialize, Default)]
 pub struct Market {
     pub groups: Vec<Group>,
+    #[serde(default)]
+    pub histories: Vec<History>,
 }
 
 pub struct Incoming {
@@ -69,6 +157,19 @@ pub fn city_name(location: &str) -> String {
         Ok(4002 | 4301) => "Fort Sterling".into(),
         Ok(5003) => "Brecilien".into(),
         _ => location.to_string(),
+    }
+}
+
+/// How long ago something happened, e.g. `45s`, `12m`, `5h` or `3d`.
+pub fn age_text(secs: u64) -> String {
+    if secs < 120 {
+        format!("{secs}s")
+    } else if secs < 7200 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
     }
 }
 
@@ -135,6 +236,9 @@ impl Market {
             entry.0 += 1;
             entry.1 += g.orders.len();
         }
+        for h in &self.histories {
+            cities.entry(h.city.clone()).or_default();
+        }
         cities.into_iter().map(|(city, (groups, orders))| (city, groups, orders)).collect()
     }
 
@@ -149,11 +253,18 @@ impl Market {
         totals
     }
 
-    /// Deletes everything stored for a city. Returns the number of item lists and orders removed.
+    /// Number of price histories stored for a city ("any" matches nothing, as for `city_totals`).
+    pub fn history_totals(&self, city: &str) -> usize {
+        self.histories.iter().filter(|h| city != "any" && city_matches(&h.city, city)).count()
+    }
+
+    /// Deletes everything stored for a city, order lists and price histories. Returns the number
+    /// of item lists and orders removed.
     pub fn purge_city(&mut self, city: &str) -> (usize, usize) {
         let totals = self.city_totals(city);
-        if totals.0 > 0 {
+        if city != "any" {
             self.groups.retain(|g| !city_matches(&g.city, city));
+            self.histories.retain(|h| !city_matches(&h.city, city));
         }
         totals
     }
@@ -254,7 +365,96 @@ impl Market {
         if missing > 0.0 {
             return Err(Shortage::NotEnough);
         }
-        Ok(Quote { average: cost / qty as f64, limit, sources })
+        Ok(Quote { average: cost / qty as f64, limit, sources, history: None })
+    }
+
+    /// Stores the price history of an item for one time window, replacing the previous one. The
+    /// game sends the whole series every time. Returns a line for the log.
+    pub fn ingest_history(&mut self, incoming: IncomingHistory, now: u64) -> String {
+        let IncomingHistory { city, key, window, points } = incoming;
+        let history = History {
+            city: city.clone(),
+            res: key.res.key().to_string(),
+            tier: key.tier,
+            enchant: key.enchant,
+            raw: key.raw,
+            scale: window.scale(),
+            updated: now,
+            points,
+        };
+        let line = match history.totals() {
+            Some((traded, average)) => format!(
+                "{city}: {} {} price history, average {} ({} sold)",
+                key.label(),
+                window.label(),
+                grouped(average, 0),
+                grouped(traded as f64, 0)
+            ),
+            None => format!("{city}: {} {} price history, nothing sold", key.label(), window.label()),
+        };
+        match self
+            .histories
+            .iter_mut()
+            .find(|h| h.city == city && h.key() == Some(key) && h.scale == window.scale())
+        {
+            Some(existing) => *existing = history,
+            None => self.histories.push(history),
+        }
+        line
+    }
+
+    /// The average price an item was sold for in the time window, weighted by the items sold.
+    /// Across the matching cities the highest average is taken, and the quote names that city.
+    pub fn history_quote(&self, key: &PriceKey, window: Window, city: &str) -> Option<Quote> {
+        let mut best: Option<Quote> = None;
+        for h in self
+            .histories
+            .iter()
+            .filter(|h| h.scale == window.scale() && h.key() == Some(*key) && city_matches(&h.city, city))
+        {
+            let Some((traded, average)) = h.totals() else { continue };
+            if best.as_ref().is_some_and(|b| b.average >= average) {
+                continue;
+            }
+            best = Some(Quote {
+                average,
+                limit: average,
+                sources: vec![Source { city: h.city.clone(), limit: average, units: 0 }],
+                history: Some(HistoryInfo { window: window.label(), traded, updated: h.updated }),
+            });
+        }
+        best
+    }
+
+    /// One row per item, city and time window with the average price and the items sold.
+    pub fn history_table(&self, now: u64) -> String {
+        let mut rows: Vec<(String, u8, u8, bool, String, u8, u64, f64, u64)> = Vec::new();
+        for h in &self.histories {
+            let Some((traded, average)) = h.totals() else { continue };
+            rows.push((h.res.clone(), h.tier, h.enchant, !h.raw, h.city.clone(), h.scale, traded, average, h.updated));
+        }
+        rows.sort_by(|a, b| (&a.0, a.1, a.2, a.3, &a.4, a.5).cmp(&(&b.0, b.1, b.2, b.3, &b.4, b.5)));
+
+        let mut out = format!(
+            "{:<20} {:<14} {:>7} {:>14} {:>10} {:>8}\n",
+            "Item", "City", "Window", "Average price", "Sold", "Age"
+        );
+        for (res, tier, enchant, refined, city, scale, traded, average, updated) in rows {
+            let name = Resource::parse(&res)
+                .map(|r| if refined { r.refined_name() } else { r.raw_name() })
+                .unwrap_or("?");
+            let window = Window::from_scale(scale).map_or("?", Window::short);
+            out.push_str(&format!(
+                "{:<20} {:<14} {:>7} {:>14} {:>10} {:>8}\n",
+                format!("T{tier}.{enchant} {name}"),
+                city,
+                window,
+                grouped(average, 0),
+                grouped(traded as f64, 0),
+                age_text(now.saturating_sub(updated))
+            ));
+        }
+        out
     }
 
     /// The average price per unit for `qty` units in the matching cities, walking through the
@@ -299,6 +499,7 @@ impl Market {
                 average: cost / qty as f64,
                 limit,
                 sources: vec![Source { city: g.city.clone(), limit, units: qty }],
+                history: None,
             };
             let better = match &best {
                 Some(b) if prefer_high => quote.average > b.average,
@@ -394,8 +595,7 @@ impl Market {
             let cell = |v: Option<(f64, usize)>| {
                 v.map_or("-".to_string(), |(p, n)| format!("{} ({}x)", grouped(p, 0), grouped(n as f64, 0)))
             };
-            let age = now.saturating_sub(row.updated);
-            let age = if age < 120 { format!("{age}s") } else if age < 7200 { format!("{}m", age / 60) } else { format!("{}h", age / 3600) };
+            let age = age_text(now.saturating_sub(row.updated));
             out.push_str(&format!(
                 "{:<20} {:<14} {:>16} {:>16} {:>8}\n",
                 format!("T{tier}.{enchant} {name}"),
@@ -504,6 +704,73 @@ mod tests {
         assert_eq!(limit(10), 100.0);
         assert_eq!(limit(11), 110.0);
         assert_eq!(limit(25), 200.0);
+    }
+
+    fn point(amount: i64, silver: f64) -> HistoryPoint {
+        HistoryPoint { amount, silver, timestamp: 0 }
+    }
+
+    fn history(city: &str, window: Window, points: Vec<HistoryPoint>) -> IncomingHistory {
+        IncomingHistory { city: city.into(), key: PriceKey::refined(Resource::Metal, 4, 1), window, points }
+    }
+
+    #[test]
+    fn history_average_is_weighted_by_the_items_sold() {
+        let mut m = Market::default();
+        // 10 items for 1000 silver and 30 items for 4200: 5200 / 40 = 130 per item.
+        m.ingest_history(history("Martlock", Window::Month, vec![point(10, 1000.0), point(30, 4200.0), point(0, 0.0)]), 5);
+        let key = PriceKey::refined(Resource::Metal, 4, 1);
+        let quote = m.history_quote(&key, Window::Month, "any").unwrap();
+        assert_eq!(quote.average, 130.0);
+        let info = quote.history.unwrap();
+        assert_eq!((info.window, info.traded, info.updated), ("4-week", 40, 5));
+        assert_eq!(quote.sources[0].city, "Martlock");
+
+        // Other windows and other items have no history.
+        assert!(m.history_quote(&key, Window::Day, "any").is_none());
+        assert!(m.history_quote(&PriceKey::refined(Resource::Metal, 5, 1), Window::Month, "any").is_none());
+        // A history in which nothing was sold has no average.
+        m.ingest_history(history("Thetford", Window::Month, vec![point(0, 0.0)]), 6);
+        assert_eq!(m.history_quote(&key, Window::Month, "thetford").map(|q| q.average), None);
+    }
+
+    #[test]
+    fn history_is_replaced_and_the_best_city_wins() {
+        let mut m = Market::default();
+        m.ingest_history(history("Martlock", Window::Day, vec![point(10, 1000.0)]), 1);
+        m.ingest_history(history("Thetford", Window::Day, vec![point(10, 1200.0)]), 1);
+        let key = PriceKey::refined(Resource::Metal, 4, 1);
+        let best = m.history_quote(&key, Window::Day, "any").unwrap();
+        assert_eq!((best.average, best.sources[0].city.as_str()), (120.0, "Thetford"));
+        assert_eq!(m.history_quote(&key, Window::Day, "martlock").unwrap().average, 100.0);
+
+        // A new series for the same item, city and window replaces the old one.
+        m.ingest_history(history("Thetford", Window::Day, vec![point(10, 900.0)]), 2);
+        assert_eq!(m.histories.len(), 2);
+        assert_eq!(m.history_quote(&key, Window::Day, "any").unwrap().average, 100.0);
+    }
+
+    #[test]
+    fn purging_a_city_removes_its_histories_too() {
+        let mut m = Market::default();
+        m.ingest_history(history("Martlock", Window::Day, vec![point(10, 1000.0)]), 1);
+        m.ingest_history(history("Thetford", Window::Day, vec![point(10, 1000.0)]), 1);
+        assert_eq!(m.cities().len(), 2);
+        assert_eq!(m.history_totals("martlock"), 1);
+        assert_eq!(m.history_totals("any"), 0);
+        m.purge_city("any");
+        assert_eq!(m.histories.len(), 2);
+        m.purge_city("martlock");
+        assert_eq!(m.histories.len(), 1);
+        assert_eq!(m.histories[0].city, "Thetford");
+    }
+
+    #[test]
+    fn ages_are_shown_in_the_largest_fitting_unit() {
+        assert_eq!(age_text(45), "45s");
+        assert_eq!(age_text(600), "10m");
+        assert_eq!(age_text(7200), "2h");
+        assert_eq!(age_text(172_800), "2d");
     }
 
     #[test]

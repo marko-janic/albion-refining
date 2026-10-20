@@ -1,11 +1,12 @@
 mod calc;
 mod config;
 mod data;
+mod ids;
 mod ingest;
 mod market;
 
 use calc::{evaluate, group, Outcome, PriceKey, Prices, Quote, Quotes, Resource, Settings, Shortage, ALL_RESOURCES};
-use market::{Market, Side};
+use market::{age_text, Market, Side, Window};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -25,6 +26,8 @@ pub struct App {
     pub sell_city: String,
     /// Sell to the highest buy order instead of listing at the lowest sell order.
     pub sell_to_buy_orders: bool,
+    /// Price history window the selling price is taken from instead of the current orders.
+    pub sell_average: Option<Window>,
     ingest_port: u16,
     /// The background market listener, when it is running.
     listener: Option<ingest::Listener>,
@@ -117,6 +120,7 @@ impl App {
             buy_city: "any".into(),
             sell_city: "any".into(),
             sell_to_buy_orders: false,
+            sell_average: None,
             ingest_port: 8080,
             listener: None,
         };
@@ -134,6 +138,7 @@ impl App {
         self.buy_city = config.buy_city;
         self.sell_city = config.sell_city;
         self.sell_to_buy_orders = config.sell_to_buy_orders;
+        self.sell_average = config.sell_average;
         self.ingest_port = config.ingest_port;
     }
 
@@ -246,15 +251,22 @@ impl App {
         }
 
         let (groups, orders) = self.with_market(|m| m.city_totals(&city));
-        if groups == 0 {
+        let histories = self.with_market(|m| m.history_totals(&city));
+        if groups == 0 && histories == 0 {
             let names: Vec<&str> = cities.iter().map(|(name, ..)| name.as_str()).collect();
             println!("No market data for '{city}'. Cities with data: {}", if names.is_empty() { "none".into() } else { names.join(", ") });
             return;
         }
 
+        let histories_text = |n: usize| match n {
+            0 => String::new(),
+            1 => " and 1 price history".to_string(),
+            n => format!(" and {n} price histories"),
+        };
         print!(
-            "Delete all data of {city} ({} orders in {groups} item lists)? This cannot be undone. Type 'yes' to confirm: ",
-            group(orders as f64, 0)
+            "Delete all data of {city} ({} orders in {groups} item lists{})? This cannot be undone. Type 'yes' to confirm: ",
+            group(orders as f64, 0),
+            histories_text(histories)
         );
         let _ = io::stdout().flush();
         if !read_line().is_some_and(|answer| answer.eq_ignore_ascii_case("yes")) {
@@ -268,7 +280,11 @@ impl App {
             ingest::write_live(market);
             removed
         });
-        println!("Deleted {} orders in {groups} item lists of {city}.", group(orders as f64, 0));
+        println!(
+            "Deleted {} orders in {groups} item lists{} of {city}.",
+            group(orders as f64, 0),
+            histories_text(histories)
+        );
     }
 
     /// Prints the market data as the listener receives it until Enter is pressed.
@@ -406,6 +422,13 @@ impl App {
             self.sell_city,
             if self.sell_to_buy_orders { "to the highest buy order" } else { "at the lowest sell order" }
         );
+        match self.sell_average {
+            Some(window) => println!(
+                "Selling price: {} average from the price history (current orders where there is none)",
+                window.label()
+            ),
+            None => println!("Selling price: from the current orders"),
+        }
     }
 
     /// Typed-in prices and whatever the Albion Data client has captured. A typed-in price of a
@@ -442,7 +465,8 @@ impl App {
         }
         let volume_note = if self.settings.focus_volume > 0.0 {
             format!(
-                "Prices are averaged over the orders needed to refine {} focus worth of each product; \
+                "Prices are averaged over the orders needed to refine {} focus worth of each product, counting the crafts made \
+                 from returned resources; the units to buy are what is left after those returns. \
                  {} recipes were left out because the market does not have that much volume (listed below).\n",
                 group(self.settings.focus_volume, 0),
                 too_shallow.len()
@@ -518,7 +542,13 @@ impl App {
                 for c in &o.components {
                     out.push_str(&component_text(c, self.settings.focus_volume > 0.0));
                 }
-                out.push_str(&sell_text(o, &self.sell_city, self.sell_to_buy_orders));
+                out.push_str(&sell_text(
+                    o,
+                    &self.sell_city,
+                    self.sell_to_buy_orders,
+                    self.sell_average,
+                    ingest::now(),
+                ));
             }
         }
         out.push_str(&left_out);
@@ -568,7 +598,7 @@ fn units(n: u64) -> String {
 
 /// The line below a product that says where to sell it. With `sell_city` set to "any" the
 /// quote was made for the best paying city; otherwise it is the city from the config.
-fn sell_text(o: &Outcome, sell_city: &str, to_buy_orders: bool) -> String {
+fn sell_text(o: &Outcome, sell_city: &str, to_buy_orders: bool, sell_average: Option<Window>, now: u64) -> String {
     let q = &o.sell_quote;
     let any = sell_city.eq_ignore_ascii_case("any");
     let city = match q.sources.first() {
@@ -584,18 +614,32 @@ fn sell_text(o: &Outcome, sell_city: &str, to_buy_orders: bool) -> String {
     let n = units(o.sell_units);
     let (average, limit) = (group(q.average, 0), group(q.limit, 0));
     if q.sources.is_empty() {
-        format!("      sell {n}{place} at {average} each (using custom value)\n")
-    } else if to_buy_orders {
-        format!("      sell {n}{place} to buy orders down to {limit} (average {average} each)\n")
+        return format!("      sell {n}{place} at {average} each (using custom value)\n");
+    }
+    if let Some(h) = &q.history {
+        return format!(
+            "      sell {n}{place} at the {} average of {average} each ({} sold, captured {} ago)\n",
+            h.window,
+            group(h.traded as f64, 0),
+            age_text(now.saturating_sub(h.updated))
+        );
+    }
+    let line = if to_buy_orders {
+        format!("      sell {n}{place} to buy orders down to {limit} (average {average} each)")
     } else {
-        format!("      sell {n}{place}: list at {average} each (lowest sell offer there)\n")
+        format!("      sell {n}{place}: list at {average} each (lowest sell offer there)")
+    };
+    match sell_average {
+        Some(window) => format!("{line} [no {} price history captured, using current orders]\n", window.label()),
+        None => format!("{line}\n"),
     }
 }
 
 /// Prices for the profit calculation, taken from the captured order books. Raw resources and the
-/// refined ingredient are bought at the cheapest sell offers; the product is sold to the highest
-/// buy orders (`sell_mode: request`) or listed at the lowest sell offer. Typed-in prices are used for
-/// items the market data knows nothing about.
+/// refined ingredient are bought at the cheapest sell offers. The product is sold at the average
+/// price of the price history when `sell_average` is set and the history is known, otherwise to the
+/// highest buy orders (`sell_mode: request`) or listed at the lowest sell offer. Typed-in prices
+/// are used for items the market data knows nothing about.
 struct MarketQuotes<'a> {
     app: &'a App,
     market: &'a Market,
@@ -613,6 +657,11 @@ impl Quotes for MarketQuotes<'_> {
         // A price typed in with `set` or `prices` always wins over the market for the product.
         if self.app.prices.contains_key(key) {
             return self.app.prices.sell(key, qty);
+        }
+        if let Some(window) = self.app.sell_average {
+            if let Some(quote) = self.market.history_quote(key, window, &self.app.sell_city) {
+                return Ok(quote);
+            }
         }
         if self.app.sell_to_buy_orders {
             self.market.quote(key, Side::Request, &self.app.sell_city, qty, true)
@@ -633,7 +682,7 @@ fn print_help() {
   purge [city]                                      delete all captured data of a city (asks for confirmation); without a city it lists them
   clear                                             delete all typed-in prices
   quit
-Settings (refining levels, city, fees, tax, buy/sell cities) are in config.json and are re-read on every command.
+Settings (refining levels, city, fees, buy/sell cities, focus volume, sell price average) are in config.json and are re-read on every command.
 Typed-in prices are saved to {STATE_FILE}; captured market data to market_data.json and the live view to market_live.txt."
     );
 }
@@ -665,6 +714,16 @@ mod tests {
             average: 7776.0,
             limit: 7700.0,
             sources: vec![Source { city: city.into(), limit: 7700.0, units: 111 }],
+            history: None,
+        }
+    }
+
+    fn history_quote(city: &str) -> Quote {
+        Quote {
+            average: 7776.0,
+            limit: 7776.0,
+            sources: vec![Source { city: city.into(), limit: 7776.0, units: 0 }],
+            history: Some(calc::HistoryInfo { window: "4-week", traded: 12345, updated: 1000 }),
         }
     }
 
@@ -672,12 +731,37 @@ mod tests {
     fn says_which_city_pays_best_when_the_sell_city_is_any() {
         let o = outcome(quote("Martlock"), 111);
         assert_eq!(
-            sell_text(&o, "any", true),
+            sell_text(&o, "any", true, None, 0),
             "      sell 111 units in Martlock (best paying city) to buy orders down to 7'700 (average 7'776 each)\n"
         );
         assert_eq!(
-            sell_text(&o, "any", false),
+            sell_text(&o, "any", false, None, 0),
             "      sell 111 units in Martlock (best paying city): list at 7'776 each (lowest sell offer there)\n"
+        );
+    }
+
+    #[test]
+    fn sells_at_the_history_average_when_there_is_one() {
+        let o = outcome(history_quote("Martlock"), 111);
+        // Captured 2 hours before "now".
+        assert_eq!(
+            sell_text(&o, "any", false, Some(Window::Month), 1000 + 7200),
+            "      sell 111 units in Martlock (best paying city) at the 4-week average of 7'776 each \
+             (12'345 sold, captured 2h ago)\n"
+        );
+        assert_eq!(
+            sell_text(&o, "Martlock", true, Some(Window::Month), 1000 + 30),
+            "      sell 111 units in Martlock at the 4-week average of 7'776 each (12'345 sold, captured 30s ago)\n"
+        );
+    }
+
+    #[test]
+    fn says_when_the_history_is_missing_and_current_orders_are_used() {
+        let o = outcome(quote("Martlock"), 1);
+        assert_eq!(
+            sell_text(&o, "any", false, Some(Window::Day), 0),
+            "      sell 1 unit in Martlock (best paying city): list at 7'776 each (lowest sell offer there) \
+             [no 24-hour price history captured, using current orders]\n"
         );
     }
 
@@ -685,7 +769,7 @@ mod tests {
     fn names_the_configured_city_otherwise() {
         let o = outcome(quote("Martlock"), 1);
         assert_eq!(
-            sell_text(&o, "Martlock", true),
+            sell_text(&o, "Martlock", true, None, 0),
             "      sell 1 unit in Martlock to buy orders down to 7'700 (average 7'776 each)\n"
         );
     }
@@ -693,7 +777,10 @@ mod tests {
     #[test]
     fn custom_values_have_no_city_unless_one_is_configured() {
         let o = outcome(Quote::flat(500.0), 4);
-        assert_eq!(sell_text(&o, "any", false), "      sell 4 units at 500 each (using custom value)\n");
-        assert_eq!(sell_text(&o, "Thetford", false), "      sell 4 units in Thetford at 500 each (using custom value)\n");
+        assert_eq!(sell_text(&o, "any", false, None, 0), "      sell 4 units at 500 each (using custom value)\n");
+        assert_eq!(
+            sell_text(&o, "Thetford", false, Some(Window::Week), 0),
+            "      sell 4 units in Thetford at 500 each (using custom value)\n"
+        );
     }
 }

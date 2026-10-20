@@ -44,6 +44,7 @@ gets the default shown here:
   "buy_city": "any",
   "sell_city": "any",
   "sell_mode": "offer",
+  "sell_average": "off",
   "focus_volume": 2000,
   "ingest_port": 8080
 }
@@ -58,6 +59,9 @@ gets the default shown here:
 - `buy_city` / `sell_city`: where raw resources are bought and refined products sold; `"any"` picks the
   cheapest (buying) or best paying (selling) city.
 - `sell_mode`: `"offer"` prices products at the lowest sell order, `"request"` at the highest buy order.
+- `sell_average`: `"off"`, `"24h"`, `"1w"` or `"4w"`. Takes the selling price of the products from the average of the
+  price history of that time window instead of the current orders. It never affects the ingredients you buy.
+  See "Selling at the history average" below.
 - `focus_volume`: how much focus worth of refining you plan to do per product; `0` turns it off. See below.
 - `ingest_port`: port of the local listener, read at startup. Use the same port in the client's `-i` option.
 
@@ -66,9 +70,13 @@ A typo in a field name or an invalid value prints an error, and the defaults are
 ### Focus volume
 
 With `focus_volume` set (for example 2000), the prices are not just the single best order. For every
-recipe the program works out how many crafts that much focus pays for (`focus_volume / focus per craft`),
-how many raw resources and lower tier items those crafts use up after the return rate, and walks through
-the captured orders to buy exactly that many, cheapest first. The price used is the average over those
+recipe the program works out how many crafts that much focus pays for (`focus_volume / focus per craft`).
+These are all the crafts you make, including the ones made from resources that come back. With focus every
+craft returns part of its ingredients (the return rate `r`, for example 43.5% in a royal city), and you
+craft again with what came back. Buying `x` crafts' worth of ingredients therefore gives
+`x + x*r + x*r² + ... = x / (1 - r)` crafts in total, so for a total of `C` crafts only `C * (1 - r)` crafts'
+worth has to be bought. The program uses that, rounded up to whole units, as the quantity to walk through
+the captured orders with, cheapest first. The price used is the average over those
 orders. Recipes whose ingredients the market does not have in that quantity are left out of the ranking
 (the ranking says how many). The `Crafts` column shows how many crafts the focus volume pays for.
 `Ingredients` is the total cost of all the ingredients for those crafts at the average prices (whole units,
@@ -96,6 +104,28 @@ city)"; with a city set in the config it is that city.
   The product is listed at the current lowest sell offer of the city with the highest such price.
 
 Buy orders are only captured when you open the buy orders tab of an item in the game.
+
+### Selling at the history average
+
+With `sell_average` set to `"24h"`, `"1w"` or `"4w"` the selling price of a product is the average price it
+was really sold for in that time window, taken from the price history that the game sends when you look at
+the price chart of an item in the market (24 hours, 7 days and 4 weeks are the three scales of the chart).
+The average is weighted by the number of items sold: total silver of the sales divided by the items sold.
+
+- Only the selling price changes. Ingredients are still bought from the current sell offers.
+- The history is captured per item, city and time window, so open the chart of each product in each city
+  with the window you chose. The ranking line says `at the 4-week average of 140'000 each (5 sold, captured 2s ago)`,
+  so you can see how many items the average is based on and how old it is.
+- With `sell_city: "any"` the city with the highest average is used. A city where only a few items were sold can
+  win this way; check the number of items sold.
+- The history is about finished sales, so the market tax still follows `sell_mode`, and the buy order depth
+  of `"request"` is not checked.
+- A product without a history for the chosen window is priced from the current orders, and its line says so
+  (`[no 4-week price history captured, using current orders]`). A price you typed in yourself still wins.
+- The game's history messages contain only a numeric item id. The ids of the refining resources come from
+  `ao-data/ao-bin-dumps` (`formatted/items.txt`, copied into `src/ids.rs`); a game update that renumbers items
+  would need that table to be regenerated.
+- `purge <city>` also deletes the price histories of that city.
 
 Raw resources use your **buy** price, refined products your **sell** price (the refined
 ingredient of the tier below is also priced at its sell price). Typed-in prices are saved to

@@ -1,4 +1,5 @@
 use crate::calc::Settings;
+use crate::market::Window;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,6 +20,7 @@ const TEMPLATE: &str = r#"{
   "buy_city": "any",
   "sell_city": "any",
   "sell_mode": "offer",
+  "sell_average": "off",
   "focus_volume": 0,
   "ingest_port": 8080
 }
@@ -30,6 +32,8 @@ pub struct Config {
     pub buy_city: String,
     pub sell_city: String,
     pub sell_to_buy_orders: bool,
+    /// Price history window to take the selling price from; None uses the current orders.
+    pub sell_average: Option<Window>,
     pub ingest_port: u16,
 }
 
@@ -40,6 +44,7 @@ impl Default for Config {
             buy_city: "any".into(),
             sell_city: "any".into(),
             sell_to_buy_orders: false,
+            sell_average: None,
             ingest_port: DEFAULT_PORT,
         }
     }
@@ -66,6 +71,7 @@ struct RawConfig {
     buy_city: String,
     sell_city: String,
     sell_mode: String,
+    sell_average: String,
     focus_volume: f64,
     ingest_port: u16,
 }
@@ -80,6 +86,7 @@ impl Default for RawConfig {
             buy_city: "any".into(),
             sell_city: "any".into(),
             sell_mode: "offer".into(),
+            sell_average: "off".into(),
             focus_volume: 0.0,
             ingest_port: DEFAULT_PORT,
         }
@@ -121,6 +128,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
         other => return Err(format!("sell_mode: '{other}' must be \"offer\" or \"request\"")),
     };
     let market_tax = if sell_to_buy_orders { SALES_TAX_PERCENT } else { SALES_TAX_PERCENT + LISTING_FEE_PERCENT };
+    let sell_average = match raw.sell_average.trim().to_lowercase().as_str() {
+        "off" | "" => None,
+        "24h" => Some(Window::Day),
+        "1w" | "7d" => Some(Window::Week),
+        "4w" => Some(Window::Month),
+        other => return Err(format!("sell_average: '{other}' must be \"off\", \"24h\", \"1w\" or \"4w\"")),
+    };
 
     if raw.ingest_port == 0 {
         return Err("ingest_port must be between 1 and 65535".into());
@@ -141,6 +155,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         buy_city: raw.buy_city.trim().to_string(),
         sell_city: raw.sell_city.trim().to_string(),
         sell_to_buy_orders,
+        sell_average,
         ingest_port: raw.ingest_port,
     })
 }
@@ -177,6 +192,7 @@ mod tests {
         assert_eq!(config.settings.usage_fee, default.settings.usage_fee);
         assert_eq!(config.buy_city, "any");
         assert!(!config.sell_to_buy_orders);
+        assert_eq!(config.sell_average, None);
         assert_eq!(config.ingest_port, default.ingest_port);
     }
 
@@ -216,9 +232,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_sell_average_window() {
+        assert_eq!(parse("{}").unwrap().sell_average, None);
+        for (text, window) in [("off", None), ("24h", Some(Window::Day)), ("1w", Some(Window::Week)), ("7d", Some(Window::Week)), ("4W", Some(Window::Month))] {
+            let config = parse(&format!(r#"{{"sell_average": "{text}"}}"#)).unwrap();
+            assert_eq!(config.sell_average, window, "{text}");
+        }
+    }
+
+    #[test]
     fn rejects_bad_input() {
         for bad in [
             "not json",
+            r#"{"sell_average": "2w"}"#,
             r#"{"mastery": {"T3": 5}}"#,
             r#"{"mastery": {"T4": 101}}"#,
             r#"{"mastery": {"T4": "high"}}"#,
