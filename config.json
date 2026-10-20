@@ -1,0 +1,17 @@
+{
+  "mastery": {
+    "T4": 100,
+    "T5": 100,
+    "T6": 100,
+    "T7": 100,
+    "T8": 100
+  },
+  "refining_city": "royal",
+  "daily_bonus": 0,
+  "usage_fee": 740,
+  "buy_city": "any",
+  "sell_city": "any",
+  "sell_mode": "offer",
+  "focus_volume": 15000,
+  "ingest_port": 8080
+}
